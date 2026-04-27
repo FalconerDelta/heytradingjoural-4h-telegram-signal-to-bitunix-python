@@ -14,14 +14,14 @@ An automated trading bot designed to listen to specific Telegram channels, parse
 
 ### 1. Signal Recognition
 The bot monitors targeted channels for messages containing "BTCUSDT" or "ETHUSDT". It is optimized for signals formatted like this:
->💎 交易品種: ETHUSDT.P 方向: 做多 (Long 🟢)
->📊 當前 ATR: ##.## 🌊 ADX 強度: ##.##
->📉 RSI: ##.#
->💰 入場價格: ####.##
->🛑 止損 (2x ATR): ####.##
->🎯 止盈 (2-4x ATR): ####.## - ####.##
->⚡️ 建議槓桿: #x
->📦 倉位價值: ###.# U
+>💎 交易品種: ETHUSDT.P 方向: 做多 (Long 🟢)\
+>📊 當前 ATR: ##.## 🌊 ADX 強度: ##.##\
+>📉 RSI: ##.#\
+>💰 入場價格: ####.##\
+>🛑 止損 (2x ATR): ####.##\
+>🎯 止盈 (2-4x ATR): ####.## - ####.##\
+>⚡️ 建議槓桿: #x\
+>📦 倉位價值: ###.# U\
 >🕒 時間: 2026-##-## 00:00:00
 
 ### 2. Execution Logic
