@@ -121,29 +121,54 @@ async def run_bot():
         if not text or not any(p in text for p in ["BTCUSDT", "ETHUSDT"]):
             return
 
+        # 1. Improved Extraction using specific Regex patterns
         try:
-            symbol = re.search(r"(BTC|ETH)USDT", text).group(0)
-            side = "BUY" if "做多" in text else "SELL"
-            entry_price = float(re.search(r"入場價格: ([\d.]+)", text).group(1))
-            sl = re.search(r"止損.*: ([\d.]+)", text).group(1)
-            tp = re.search(r"止盈.*: ([\d.]+)", text).group(1)
+            # Extract Symbol (e.g., ETHUSDT)
+            symbol_match = re.search(r"交易品種:\s*([A-Z]+)", text)
+            # Extract Side (Look for Long/Short or Chinese characters)
+            side_match = re.search(r"方向:\s*.*(做多|做空|Long|Short)", text)
+            # Extract Entry Price
+            entry_match = re.search(r"入場價格:\s*([\d.]+)", text)
+            # Extract SL
+            sl_match = re.search(r"止損.*:\s*([\d.]+)", text)
+            # Extract TP (Takes the first TP value in a range like 1910.60 - 1759.32)
+            tp_match = re.search(r"止盈.*:\s*([\d.]+)", text)
+            # Extract Leverage (Look for number before 'x')
+            lev_match = re.search(r"建議槓桿:\s*([\d.]+)x", text)
 
-            # 1. Close existing positions for this ticker first
-            trader.close_ticker_positions(symbol)
-            
-            # Small delay to ensure the engine processes the close before the new open
-            await asyncio.sleep(0.5)
-
-            # 2. Get balance and place new order
-            current_bal = trader.get_account_info()
-            if current_bal < 2.0: 
-                logging.warning("Balance too low to open new position.")
+            # Validation: Ensure all critical data points exist
+            if not all([symbol_match, side_match, entry_match, sl_match, tp_match]):
+                logging.info("Message received but did not match expected trading format.")
                 return
 
-            qty_str = f"{(current_bal * 0.4) / entry_price:.4f}"
-            logging.info(f"🎯 SIGNAL: {symbol} {side}")
+            symbol = symbol_match.group(1).replace(".P", "")
+            raw_side = side_match.group(1)
+            side = "BUY" if raw_side in ["做多", "Long"] else "SELL"
+            entry_price = float(entry_match.group(1))
+            sl = sl_match.group(1)
+            tp = tp_match.group(1)
+            leverage = float(lev_match.group(1)) if lev_match else 1.0 # Default to 1x if not found
+
+            logging.info(f"✅ Parsed Signal: {symbol} {side} | Entry: {entry_price} | Lev: {leverage}x")
+
+            # 2. Close existing positions for this ticker first
+            trader.close_ticker_positions(symbol)
+            await asyncio.sleep(0.5)
+
+            # 3. Get balance and calculate Qty
+            current_bal = trader.get_account_info()
+            if current_bal < 2.0: 
+                logging.warning(f"Balance too low ({current_bal} USDT).")
+                return
+
+            # Qty Logic: (Balance * Leverage) / Entry Price
+            qty_val = (current_bal * leverage) / entry_price
+            qty_str = f"{qty_val:.4f}"
+
+            # 4. Place Order
+            logging.info(f"🚀 Executing {side} on {symbol} with {leverage}x leverage (Qty: {qty_str})")
             trader.place_market_order(symbol, side, qty_str, sl, tp)
-            
+        
         except Exception as e:
             logging.error(f"Parsing error: {e}")
 
