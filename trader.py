@@ -3,100 +3,137 @@ import re
 import time
 import json
 import hashlib
+import secrets
 import requests
-from telethon import TelegramClient, events
+import asyncio
+import logging
+from telethon import TelegramClient, events, errors
 from dotenv import load_dotenv
 
-# Load credentials from .env
+# Load environment variables
 load_dotenv()
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 API_ID = int(os.getenv('TELEGRAM_API_ID'))
 API_HASH = os.getenv('TELEGRAM_API_HASH')
-CHANNEL_USERNAME = os.getenv('TELEGRAM_CHANNEL_USERNAME')
+raw_channels = os.getenv('TELEGRAM_CHANNEL_USERNAME', 'me')
+TARGET_CHANNELS = [int(c.strip()) if c.strip().lstrip('-').isdigit() else c.strip() for c in raw_channels.split(',')]
 
 BITUNIX_KEY = os.getenv('BITUNIX_API_KEY')
 BITUNIX_SECRET = os.getenv('BITUNIX_API_SECRET')
 BASE_URL = "https://fapi.bitunix.com"
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class BitunixTrader:
     def __init__(self, key, secret):
         self.key = key
         self.secret = secret
 
-    def _generate_sign(self, nonce, timestamp, body_str):
-        # Bitunix Official Signature: SHA256(apiKey + nonce + timestamp + body + apiSecret)
-        payload_str = f"{self.key}{nonce}{timestamp}{body_str}{self.secret}"
-        return hashlib.sha256(payload_str.encode('utf-8')).hexdigest()
+    def _generate_sign(self, nonce, timestamp, query_str="", body_str=""):
+        digest_input = f"{nonce}{timestamp}{self.key}{query_str}{body_str}"
+        first_hash = hashlib.sha256(digest_input.encode('utf-8')).hexdigest()
+        sign_input = f"{first_hash}{self.secret}"
+        return hashlib.sha256(sign_input.encode('utf-8')).hexdigest()
 
-    def place_order(self, symbol, direction, price, tp, sl):
-        endpoint = "/api/v1/futures/trade/place_order"
+    def get_account_info(self):
+        endpoint = "/api/v1/futures/account"
         timestamp = str(int(time.time() * 1000))
-        nonce = os.urandom(8).hex()
-        
-        # Per Documentation: 
-        # side: "BUY" or "SELL" (String)
-        # open: 1 (Open), 2 (Close) (Integer)
-        # type: 1 (Limit), 2 (Market) (Integer)
-        side_string = "BUY" if "做多" in direction else "SELL"
-        
-        data = {
-            "symbol": symbol.replace(".P", ""),
-            "side": side_string, 
-            "type": 1,           # 1 = Limit Order
-            "price": str(price),
-            "vol": "1",          # Number of contracts
-            "open": 1,           # 1 = Open position
-            "stopLoss": str(sl),
-            "takeProfit": str(tp)
-        }
-
-        # Body must be minified for signature verification
-        body_str = json.dumps(data, separators=(',', ':'))
+        nonce = secrets.token_hex(16)
+        params = {"marginCoin": "USDT"}
+        query_str = "marginCoinUSDT"
         
         headers = {
-            "api-key": self.key,
-            "nonce": nonce,
-            "timestamp": timestamp,
-            "sign": self._generate_sign(nonce, timestamp, body_str),
+            "api-key": self.key, "nonce": nonce, "timestamp": timestamp,
+            "sign": self._generate_sign(nonce, timestamp, query_str=query_str),
+            "Content-Type": "application/json"
+        }
+        try:
+            response = requests.get(BASE_URL + endpoint, headers=headers, params=params, timeout=10)
+            data = response.json()
+            return float(data.get('data', {}).get('available', 0.0)) if data.get('code') == 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def place_market_order(self, symbol, side, qty, sl, tp):
+        endpoint = "/api/v1/futures/trade/place_order"
+        timestamp = str(int(time.time() * 1000))
+        nonce = secrets.token_hex(16)
+
+        order_data = {
+            "orderType": "MARKET", "price": "0", "qty": str(qty),
+            "side": side, "tpPrice": str(tp), "slPrice": str(sl),
+            "symbol": symbol.replace(".P", ""), "tradeSide": "OPEN"
+        }
+
+        body_str = json.dumps(order_data, separators=(',', ':'), sort_keys=True)
+        headers = {
+            "api-key": self.key, "nonce": nonce, "timestamp": timestamp,
+            "sign": self._generate_sign(nonce, timestamp, body_str=body_str),
             "Content-Type": "application/json"
         }
 
         try:
-            response = requests.post(BASE_URL + endpoint, headers=headers, data=body_str)
-            return response.json()
+            response = requests.post(BASE_URL + endpoint, headers=headers, data=body_str, timeout=15)
+            result = response.json()
+            logging.info(f"📥 Response: {json.dumps(result)}")
+            return result
         except Exception as e:
-            return {"error": str(e)}
+            logging.error(f"Order failed: {e}")
+            return None
 
-# --- TELEGRAM MONITOR ---
-trader = BitunixTrader(BITUNIX_KEY, BITUNIX_SECRET)
-client = TelegramClient('bitunix_session', API_ID, API_HASH)
+async def run_bot():
+    trader = BitunixTrader(BITUNIX_KEY, BITUNIX_SECRET)
+    # Using 'bitunix_session' as the session file name
+    client = TelegramClient('bitunix_trader_session', API_ID, API_HASH, auto_reconnect=True)
 
-@client.on(events.NewMessage(chats=CHANNEL_USERNAME))
-async def handle_new_signal(event):
-    text = event.raw_text
-    
-    # Filter for BTC and ETH only
-    if not any(x in text for x in ["BTCUSDT", "ETHUSDT"]):
-        return
+    @client.on(events.NewMessage(chats=TARGET_CHANNELS))
+    async def handle_new_signal(event):
+        text = event.raw_text
+        if not text or not any(p in text for p in ["BTCUSDT", "ETHUSDT"]):
+            return
 
+        try:
+            symbol = re.search(r"(BTC|ETH)USDT", text).group(0)
+            side = "BUY" if "做多" in text else "SELL"
+            entry_price = float(re.search(r"入場價格: ([\d.]+)", text).group(1))
+            sl = re.search(r"止損.*: ([\d.]+)", text).group(1)
+            tp = re.search(r"止盈.*: ([\d.]+)", text).group(1)
+
+            current_bal = trader.get_account_info()
+            if current_bal < 2.0: return
+
+            qty_str = f"{(current_bal * 0.4) / entry_price:.4f}"
+            logging.info(f"🎯 SIGNAL: {symbol} {side}")
+            trader.place_market_order(symbol, side, qty_str, sl, tp)
+        except Exception as e:
+            logging.error(f"Parsing error: {e}")
+
+    retry_delay = 5
+    while True:
+        try:
+            logging.info("🔗 Connecting to Telegram...")
+            await client.start()
+            
+            # Startup Balance Check
+            balance = trader.get_account_info()
+            logging.info(f"✅ Live! Balance: {balance} USDT")
+
+            await client.run_until_disconnected()
+            
+        except (ConnectionError, OSError, asyncio.CancelledError) as e:
+            logging.error(f"📡 Network issue ({type(e).__name__}). Retrying in {retry_delay}s...")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+        except Exception as e:
+            logging.critical(f"🔥 Unexpected error: {e}")
+            await asyncio.sleep(10)
+        finally:
+            retry_delay = 5
+
+if __name__ == "__main__":
     try:
-        # Parsing using regex based on your provided sample
-        symbol = re.search(r"(BTC|ETH)USDT", text).group(0)
-        direction = "做多" if "做多" in text else "做空"
-        entry = re.search(r"入場價格: ([\d.]+)", text).group(1)
-        sl = re.search(r"止損.*: ([\d.]+)", text).group(1)
-        # Grab only the first TP value before the hyphen
-        tp = re.search(r"止盈.*: ([\d.]+)", text).group(1)
-
-        print(f"✅ Found Signal: {symbol} {direction} @ {entry}")
-        
-        resp = trader.place_order(symbol, direction, entry, tp, sl)
-        print(f"📊 Bitunix Response: {json.dumps(resp)}")
-
-    except Exception as e:
-        print(f"❌ Error parsing signal: {e}")
-
-print("🚀 Bot started. Monitoring Telegram for BTC/ETH signals...")
-client.start()
-client.run_until_disconnected()
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        pass
