@@ -56,6 +56,34 @@ class BitunixTrader:
         except Exception:
             return 0.0
 
+    def close_ticker_positions(self, symbol):
+        """Closes all existing positions for a specific ticker before opening a new one."""
+        endpoint = "/api/v1/futures/trade/close_all_position"
+        timestamp = str(int(time.time() * 1000))
+        nonce = secrets.token_hex(16)
+        
+        # Format required by Bitunix: {"symbol":"BTCUSDT"}
+        body_data = {"symbol": symbol.replace(".P", "")}
+        body_str = json.dumps(body_data, separators=(',', ':'), sort_keys=True)
+
+        headers = {
+            "api-key": self.key, 
+            "nonce": nonce, 
+            "timestamp": timestamp,
+            "sign": self._generate_sign(nonce, timestamp, body_str=body_str),
+            "Content-Type": "application/json"
+        }
+
+        try:
+            logging.info(f"🔄 Closing all existing positions for {symbol}...")
+            response = requests.post(BASE_URL + endpoint, headers=headers, data=body_str, timeout=15)
+            result = response.json()
+            logging.info(f"📥 Close Response: {json.dumps(result)}")
+            return result
+        except Exception as e:
+            logging.error(f"Failed to close positions: {e}")
+            return None
+
     def place_market_order(self, symbol, side, qty, sl, tp):
         endpoint = "/api/v1/futures/trade/place_order"
         timestamp = str(int(time.time() * 1000))
@@ -85,7 +113,6 @@ class BitunixTrader:
 
 async def run_bot():
     trader = BitunixTrader(BITUNIX_KEY, BITUNIX_SECRET)
-    # Using 'bitunix_session' as the session file name
     client = TelegramClient('bitunix_trader_session', API_ID, API_HASH, auto_reconnect=True)
 
     @client.on(events.NewMessage(chats=TARGET_CHANNELS))
@@ -101,12 +128,22 @@ async def run_bot():
             sl = re.search(r"止損.*: ([\d.]+)", text).group(1)
             tp = re.search(r"止盈.*: ([\d.]+)", text).group(1)
 
+            # 1. Close existing positions for this ticker first
+            trader.close_ticker_positions(symbol)
+            
+            # Small delay to ensure the engine processes the close before the new open
+            await asyncio.sleep(0.5)
+
+            # 2. Get balance and place new order
             current_bal = trader.get_account_info()
-            if current_bal < 2.0: return
+            if current_bal < 2.0: 
+                logging.warning("Balance too low to open new position.")
+                return
 
             qty_str = f"{(current_bal * 0.4) / entry_price:.4f}"
             logging.info(f"🎯 SIGNAL: {symbol} {side}")
             trader.place_market_order(symbol, side, qty_str, sl, tp)
+            
         except Exception as e:
             logging.error(f"Parsing error: {e}")
 
@@ -116,7 +153,6 @@ async def run_bot():
             logging.info("🔗 Connecting to Telegram...")
             await client.start()
             
-            # Startup Balance Check
             balance = trader.get_account_info()
             logging.info(f"✅ Live! Balance: {balance} USDT")
 
